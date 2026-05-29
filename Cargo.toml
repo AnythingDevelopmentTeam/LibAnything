@@ -1,0 +1,17 @@
+[package]
+name = "libanything"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+log = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+# Все WinAPI вызовы объявлены вручную через extern "system"
+# (см. src/win32_ffi.rs) — никакой внешней зависимости не требуется.
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
