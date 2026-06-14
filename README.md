@@ -1,8 +1,8 @@
 # LibAnything
 
-Low-level filesystem indexer — walks `/` recursively and writes a YAML index.
+Low-level filesystem indexer — walks `/` recursively and writes a binary index.
 
-Index output: `~/.config/anything-index.yaml`
+Index output: `~/.config/anything-index.anythingindex`
 
 ## Architecture
 
