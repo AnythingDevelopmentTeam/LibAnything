@@ -1,251 +1,272 @@
-// ═══════════════════════════════════════════════════════════════════════════════
-// LibAnything — низкоуровневое ядро-индексатор
-// Лицензия: GPL v3
-//
-// Архитектура:
-//   Windows — прямое чтение MFT через CreateFileW (\\.\C:)
-//   POSIX   — рекурсивный обход дерева каталогов
-//
-// Экспортирует C-совместимый FFI для динамической загрузки
-// (LibAnything.dll / .so / .dylib).
-// ═══════════════════════════════════════════════════════════════════════════════
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
-use std::ffi::{c_char, CStr, CString};
-use std::path::Path;
-use std::sync::Mutex;
+mod index_format;
+pub use index_format::*;
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Внутреннее состояние индексатора
+// Data
 // ──────────────────────────────────────────────────────────────────────────────
 
-static INITIALIZED: Mutex<bool> = Mutex::new(false);
+#[derive(Debug, Clone)]
+pub struct FileRecord {
+    pub id: u64,
+    pub parent_id: u64,
+    pub name: String,
+}
 
-/// Дескриптор открытого тома (Windows) или корневой путь (POSIX).
-/// Хранится как isize для платформенной независимости.
-static VOLUME_HANDLE: Mutex<isize> = Mutex::new(0);
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Ручные FFI-привязки к Win32 API (без внешних крейтов)
-// ──────────────────────────────────────────────────────────────────────────────
-
-#[cfg(target_os = "windows")]
-mod win32 {
-    #[allow(unused_imports)]
-    use std::ffi::c_void;
-
-    pub type HANDLE = isize;
-    pub type BOOL = i32;
-    pub type DWORD = u32;
-    pub type LPCWSTR = *const u16;
-    #[allow(non_camel_case_types)]
-    pub type LPSECURITY_ATTRIBUTES = *mut std::ffi::c_void;
-
-    pub const GENERIC_READ: DWORD = 0x80000000;
-    pub const FILE_SHARE_READ: DWORD = 0x00000001;
-    pub const FILE_SHARE_WRITE: DWORD = 0x00000002;
-    pub const OPEN_EXISTING: DWORD = 3;
-    pub const FILE_FLAG_NO_BUFFERING: DWORD = 0x20000000;
-    pub const INVALID_HANDLE_VALUE: HANDLE = -1;
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        pub fn CreateFileW(
-            lpFileName: LPCWSTR,
-            dwDesiredAccess: DWORD,
-            dwShareMode: DWORD,
-            lpSecurityAttributes: LPSECURITY_ATTRIBUTES,
-            dwCreationDisposition: DWORD,
-            dwFlagsAndAttributes: DWORD,
-            hTemplateFile: HANDLE,
-        ) -> HANDLE;
-
-        pub fn CloseHandle(hObject: HANDLE) -> BOOL;
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexerStatus {
+    Idle,
+    Running,
+    Completed,
+    Failed,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Вспомогательные FFI-функции
+// IgnoreConfig — rules for skipping dirs/files during walk & search
 // ──────────────────────────────────────────────────────────────────────────────
 
-unsafe fn cstr_to_str<'a>(ptr: *const c_char) -> &'a str {
-    if ptr.is_null() {
-        return "";
-    }
-    CStr::from_ptr(ptr).to_str().unwrap_or_default()
+#[derive(Debug, Clone)]
+pub struct IgnoreConfig {
+    pub skip_dir_prefixes: Vec<String>,
+    pub skip_file_names: Vec<String>,
+    pub skip_file_exts: Vec<String>,
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// FFI: инициализация индексатора
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Инициализирует индексатор.
-///
-/// # Аргументы
-/// * `volume_path` — указатель на C-строку с путём к тому
-///   (например, `"\\\\.\\C:"` на Windows, `"/"` на Linux/macOS).
-///
-/// # Возвращает
-/// `0` при успехе, `-1` при ошибке.
-#[no_mangle]
-pub extern "C" fn init_indexer(volume_path: *const c_char) -> i32 {
-    let mut init = INITIALIZED.lock().unwrap();
-    if *init {
-        log::warn!("init_indexer: already initialized, skipping");
-        return 0;
+impl IgnoreConfig {
+    pub fn new() -> Self {
+        IgnoreConfig {
+            skip_dir_prefixes: Vec::new(),
+            skip_file_names: Vec::new(),
+            skip_file_exts: Vec::new(),
+        }
     }
 
-    let path = unsafe { cstr_to_str(volume_path) };
-    if path.is_empty() {
-        log::error!("init_indexer: volume_path is null or empty");
-        return -1;
+    /// Directory path prefixes that should not be entered during the walk.
+    pub fn is_skip_dir(&self, path: &Path) -> bool {
+        let s = path.to_string_lossy();
+        self.skip_dir_prefixes
+            .iter()
+            .any(|p| s == *p || (s.starts_with(p) && s.as_bytes().get(p.len()) == Some(&b'/')))
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        // Прямое чтение сырого тома через CreateFileW
-        // ──────────────────────────────────────────────────────────────────────
-        //  CreateFileW(\\.\C:, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE,
-        //              NULL, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, NULL)
-        // ──────────────────────────────────────────────────────────────────────
-        let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-
-        let handle = unsafe {
-            win32::CreateFileW(
-                wide.as_ptr(),
-                win32::GENERIC_READ,
-                win32::FILE_SHARE_READ | win32::FILE_SHARE_WRITE,
-                std::ptr::null_mut(),
-                win32::OPEN_EXISTING,
-                win32::FILE_FLAG_NO_BUFFERING,
-                0,
-            )
+    /// File that should be filtered out from search results by name.
+    pub fn is_noise(&self, path: &str) -> bool {
+        let name = match Path::new(path).file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => return false,
         };
+        let lower_name = name.to_lowercase();
 
-        if handle == win32::INVALID_HANDLE_VALUE {
-            log::error!("init_indexer: CreateFileW failed for path '{}'", path);
-            return -1;
+        if self.skip_file_names.iter().any(|n| lower_name == *n) {
+            return true;
         }
 
-        let mut vol = VOLUME_HANDLE.lock().unwrap();
-        *vol = handle as isize;
-        *init = true;
-    }
+        if lower_name.ends_with('~') {
+            return true;
+        }
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        let mut vol = VOLUME_HANDLE.lock().unwrap();
-        *vol = 1;
-        *init = true;
-    }
-
-    0
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// FFI: Shutdown
-// ──────────────────────────────────────────────────────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn shutdown_indexer() -> i32 {
-    let mut init = INITIALIZED.lock().unwrap();
-    if !*init {
-        log::warn!("shutdown_indexer: not initialized");
-        return 0;
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let mut vol = VOLUME_HANDLE.lock().unwrap();
-        if *vol != 0 && *vol != -1 {
-            unsafe {
-                win32::CloseHandle(*vol as win32::HANDLE);
+        if let Some(ext) = Path::new(name).extension().and_then(|e| e.to_str()) {
+            let ext_lower = ext.to_lowercase();
+            if self.skip_file_exts.iter().any(|e| ext_lower == *e) {
+                return true;
             }
         }
-        *vol = 0;
-    }
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        let mut vol = VOLUME_HANDLE.lock().unwrap();
-        *vol = 0;
+        false
     }
-
-    *init = false;
-    0
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// FFI: Init
+// Indexer — walks from /, writes .anythingindex
 // ──────────────────────────────────────────────────────────────────────────────
 
-#[no_mangle]
-pub extern "C" fn run_indexation(
-    callback: Option<extern "C" fn(*const c_char, u64, u64)>,
-) -> i32 {
-    let init = INITIALIZED.lock().unwrap();
-    if !*init {
-        log::error!("run_indexation: indexer not initialized");
-        return -1;
-    }
+pub struct Indexer {
+    cancel: Arc<AtomicBool>,
+    status: Arc<RwLock<IndexerStatus>>,
+    progress: Arc<AtomicU64>,
+    records: Arc<RwLock<Vec<FileRecord>>>,
+    output: PathBuf,
+    pub compressed: bool,
+    ignore: IgnoreConfig,
+}
 
-    let cb = match callback {
-        Some(f) => f,
-        None => {
-            log::error!("run_indexation: callback is null");
-            return -1;
+impl Indexer {
+    pub fn new(output: PathBuf) -> Self {
+        Indexer {
+            cancel: Arc::new(AtomicBool::new(false)),
+            status: Arc::new(RwLock::new(IndexerStatus::Idle)),
+            progress: Arc::new(AtomicU64::new(0)),
+            records: Arc::new(RwLock::new(Vec::new())),
+            output,
+            compressed: true,
+            ignore: IgnoreConfig::new(),
         }
-    };
-
-
-    for (path, id, parent) in &fake_entries {
-        let c_path = CString::new(*path).unwrap();
-        cb(c_path.as_ptr(), *id, *parent);
     }
 
-    0
-}
+    pub fn set_ignore_config(&mut self, config: IgnoreConfig) {
+        self.ignore = config;
+    }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// API: FS Scan
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Сканирует указанные корневые каталоги и возвращает список полных путей ко всем
-/// найденным файлам (не включает каталоги). Обходит дерево рекурсивно, пропуская
-/// символические ссылки для предотвращения циклов.
-pub fn scan_directories(roots: &[&str]) -> Vec<String> {
-    let mut all_files = Vec::new();
-    for root in roots {
-        let path = Path::new(root);
-        if !path.exists() || !path.is_dir() {
-            log::warn!("scan_directories: skipped '{root}' — not found or not a dir");
-            continue;
+    pub fn start(&mut self) {
+        if *self.status.read().unwrap() == IndexerStatus::Running {
+            log::warn!("Indexer already running");
+            return;
         }
-        scan_dir(path, &mut all_files);
+
+        *self.status.write().unwrap() = IndexerStatus::Running;
+        self.cancel.store(false, Ordering::SeqCst);
+        self.progress.store(0, Ordering::SeqCst);
+        *self.records.write().unwrap() = Vec::new();
+
+        let cancel = self.cancel.clone();
+        let status = self.status.clone();
+        let progress = self.progress.clone();
+        let shared_records = self.records.clone();
+        let output = self.output.clone();
+        let compressed = self.compressed;
+        let ignore = Arc::new(self.ignore.clone());
+
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let mut records = Vec::new();
+
+            records.push(FileRecord {
+                id: 1,
+                parent_id: 0,
+                name: "/".into(),
+            });
+            progress.fetch_add(1, Ordering::SeqCst);
+
+            *shared_records.write().unwrap() = records.clone();
+
+            let cancel_watchdog = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(45));
+                cancel_watchdog.store(true, Ordering::SeqCst);
+            });
+
+            walk(Path::new("/"), &mut records, &shared_records, &cancel, &progress, &ignore);
+
+            if cancel.load(Ordering::SeqCst) {
+                *status.write().unwrap() = IndexerStatus::Idle;
+                return;
+            }
+
+            let result = build_index_file(&records, &output, compressed, &cancel);
+
+            match result {
+                Ok(()) => {
+                    let elapsed = start.elapsed();
+                    log::info!(
+                        "Index written to {:?} ({} entries, {:.1}s)",
+                        output,
+                        progress.load(Ordering::SeqCst),
+                        elapsed.as_secs_f64()
+                    );
+                    *status.write().unwrap() = IndexerStatus::Completed;
+                }
+                Err(e) => {
+                    if e == "cancelled" {
+                        *status.write().unwrap() = IndexerStatus::Idle;
+                    } else {
+                        log::error!("Failed to write index: {}", e);
+                        *status.write().unwrap() = IndexerStatus::Failed;
+                    }
+                }
+            }
+        });
     }
-    all_files
+
+    pub fn status(&self) -> IndexerStatus {
+        *self.status.read().unwrap()
+    }
+
+    pub fn progress(&self) -> u64 {
+        self.progress.load(Ordering::SeqCst)
+    }
+
+    pub fn partial_records(&self) -> Vec<FileRecord> {
+        self.records.read().unwrap().clone()
+    }
 }
 
-fn scan_dir(dir: &Path, files: &mut Vec<String>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries {
+// ──────────────────────────────────────────────────────────────────────────────
+// Filesystem walk
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn walk(
+    root: &Path,
+    records: &mut Vec<FileRecord>,
+    shared: &Arc<RwLock<Vec<FileRecord>>>,
+    cancel: &AtomicBool,
+    progress: &AtomicU64,
+    ignore: &Arc<IgnoreConfig>,
+) {
+    let ignore_clone = ignore.clone();
+    let walker = jwalk::WalkDir::new(root)
+        .process_read_dir(move |_depth, _path, _state, children| {
+            children.retain(|e| {
+                let Ok(e) = e else { return false };
+                if e.file_type().is_symlink() { return false; }
+                let path = e.path();
+                !ignore_clone.is_skip_dir(&path)
+            });
+        });
+
+    let mut parent_ids: HashMap<PathBuf, u64> = HashMap::new();
+    let mut id_counter: u64 = 2;
+    let mut last_sync = 0usize;
+
+    parent_ids.insert(root.to_path_buf(), 1);
+
+    for entry in walker {
+        if cancel.load(Ordering::SeqCst) {
+            return;
+        }
+
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
         };
+
         let path = entry.path();
-        // Пропускаем симлинки (предотвращаем циклы)
-        if path.is_symlink() {
-            continue;
+        if cancel.load(Ordering::SeqCst) {
+            return;
         }
-        if path.is_dir() {
-            scan_dir(&path, files);
-        } else if path.is_file() {
-            if let Some(s) = path.to_str() {
-                files.push(s.to_owned());
+
+        let my_id = id_counter;
+        id_counter += 1;
+
+        if let Some(name) = path.to_str() {
+            let parent_path = path.parent().unwrap_or(root);
+            let parent_id = parent_ids.get(parent_path).copied().unwrap_or(1);
+            parent_ids.insert(path.to_path_buf(), my_id);
+
+            records.push(FileRecord {
+                id: my_id,
+                parent_id,
+                name: name.to_string(),
+            });
+            progress.fetch_add(1, Ordering::SeqCst);
+        }
+
+        if records.len() - last_sync >= 5000 {
+            let new_slice = &records[last_sync..];
+            if let Ok(mut guard) = shared.write() {
+                guard.extend_from_slice(new_slice);
             }
+            last_sync = records.len();
+        }
+    }
+
+    if last_sync < records.len() {
+        let new_slice = &records[last_sync..];
+        if let Ok(mut guard) = shared.write() {
+            guard.extend_from_slice(new_slice);
         }
     }
 }
@@ -257,32 +278,186 @@ fn scan_dir(dir: &Path, files: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::CString;
 
-    #[test]
-    fn test_init_shutdown_cycle() {
-        let path = CString::new("\\\\.\\C:").unwrap();
-        assert_eq!(init_indexer(path.as_ptr()), 0);
-        assert_eq!(shutdown_indexer(), 0);
+    fn test_ignore() -> IgnoreConfig {
+        IgnoreConfig {
+            skip_dir_prefixes: vec![
+                "/proc".into(),
+                "/sys".into(),
+                "/dev".into(),
+                "/run".into(),
+                "/snap".into(),
+                "/lost+found".into(),
+                "/tmp".into(),
+                "/boot".into(),
+                "/lib".into(),
+                "/lib64".into(),
+                "/usr/lib".into(),
+                "/usr/lib64".into(),
+                "/usr/share/zoneinfo".into(),
+                "/usr/share/doc".into(),
+                "/usr/share/help".into(),
+                "/usr/share/man".into(),
+                "/usr/include".into(),
+                "/usr/src".into(),
+                "/var/cache".into(),
+                "/var/log".into(),
+                "/var/tmp".into(),
+                "/opt".into(),
+                "/sysroot".into(),
+                "/var/lib/docker".into(),
+                "/var/lib/flatpak".into(),
+            ],
+            skip_file_names: vec![
+                "thumbs.db".into(),
+                "desktop.ini".into(),
+                ".ds_store".into(),
+                "icon\r".into(),
+            ],
+            skip_file_exts: vec![
+                "tmp".into(),
+                "temp".into(),
+                "bak".into(),
+            ],
+        }
     }
 
     #[test]
-    fn test_init_null_path() {
-        assert_eq!(init_indexer(std::ptr::null()), -1);
+    fn test_indexer_lifecycle() {
+        let tmp = std::env::temp_dir().join("libanything-test.anythingindex");
+        let indexer = Indexer::new(tmp.clone());
+        assert_eq!(indexer.status(), IndexerStatus::Idle);
+        assert_eq!(indexer.progress(), 0);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
-    fn test_double_init() {
-        let path = CString::new("\\\\.\\C:").unwrap();
-        assert_eq!(init_indexer(path.as_ptr()), 0);
-        assert_eq!(init_indexer(path.as_ptr()), 0);
-        shutdown_indexer();
+    fn test_walk_small_dir() {
+        let tmp = std::env::temp_dir().join("libanything-walk-test");
+        let _ = std::fs::create_dir_all(&tmp);
+        std::fs::write(tmp.join("a.txt"), "hello").ok();
+        std::fs::write(tmp.join("b.txt"), "world").ok();
+        let sub = tmp.join("sub");
+        let _ = std::fs::create_dir_all(&sub);
+        std::fs::write(sub.join("c.txt"), "deep").ok();
+
+        let mut records = Vec::new();
+        records.push(FileRecord {
+            id: 1,
+            parent_id: 0,
+            name: "/".into(),
+        });
+        let cancel = AtomicBool::new(false);
+        let progress = AtomicU64::new(0);
+        let shared = Arc::new(RwLock::new(Vec::new()));
+        let ignore = Arc::new(IgnoreConfig::new());
+
+        walk(&tmp, &mut records, &shared, &cancel, &progress, &ignore);
+
+        assert!(!records.is_empty());
+        assert!(progress.load(Ordering::SeqCst) > 0);
+        assert!(!shared.read().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn test_run_indexation_without_init() {
-        assert_eq!(run_indexation(Some(dummy_callback)), -1);
+    fn test_cancel() {
+        let cancel = AtomicBool::new(true);
+        let mut records = Vec::new();
+        let progress = AtomicU64::new(0);
+        let shared = Arc::new(RwLock::new(Vec::new()));
+        let ignore = Arc::new(IgnoreConfig::new());
+        records.push(FileRecord {
+            id: 1,
+            parent_id: 0,
+            name: "/".into(),
+        });
+
+        walk(Path::new("/"), &mut records, &shared, &cancel, &progress, &ignore);
+        assert_eq!(records.len(), 1);
     }
 
-    extern "C" fn dummy_callback(_path: *const c_char, _id: u64, _parent: u64) {}
+    #[test]
+    fn test_skip_dir_filtering() {
+        let ig = test_ignore();
+        assert!(ig.is_skip_dir(Path::new("/proc")));
+        assert!(ig.is_skip_dir(Path::new("/proc/self")));
+        assert!(ig.is_skip_dir(Path::new("/sys/class")));
+        assert!(ig.is_skip_dir(Path::new("/dev")));
+        assert!(ig.is_skip_dir(Path::new("/dev/shm")));
+        assert!(ig.is_skip_dir(Path::new("/run/user/1000")));
+        assert!(ig.is_skip_dir(Path::new("/snap/core/1234")));
+        assert!(ig.is_skip_dir(Path::new("/lost+found")));
+        assert!(ig.is_skip_dir(Path::new("/var/lib/docker/overlay2")));
+        assert!(ig.is_skip_dir(Path::new("/var/lib/flatpak/repo")));
+        assert!(ig.is_skip_dir(Path::new("/tmp")));
+        assert!(ig.is_skip_dir(Path::new("/tmp/foo")));
+        assert!(ig.is_skip_dir(Path::new("/boot")));
+        assert!(ig.is_skip_dir(Path::new("/lib/x86_64-linux-gnu")));
+        assert!(ig.is_skip_dir(Path::new("/lib64")));
+        assert!(ig.is_skip_dir(Path::new("/usr/lib/python3")));
+        assert!(ig.is_skip_dir(Path::new("/usr/share/zoneinfo/America")));
+        assert!(ig.is_skip_dir(Path::new("/usr/share/doc/bash")));
+        assert!(ig.is_skip_dir(Path::new("/usr/include/linux")));
+        assert!(ig.is_skip_dir(Path::new("/var/cache/apt")));
+        assert!(ig.is_skip_dir(Path::new("/var/log/syslog")));
+        assert!(ig.is_skip_dir(Path::new("/opt/google")));
+        assert!(ig.is_skip_dir(Path::new("/sysroot")));
+        assert!(!ig.is_skip_dir(Path::new("/home/user/proc")));
+        assert!(!ig.is_skip_dir(Path::new("/home/user/dev")));
+    }
+
+    #[test]
+    fn test_noise_filter() {
+        let ig = test_ignore();
+        assert!(ig.is_noise("/home/user/thumbs.db"));
+        assert!(ig.is_noise("/home/user/desktop.ini"));
+        assert!(ig.is_noise("/home/user/.ds_store"));
+        assert!(!ig.is_noise("/home/user/report.pdf"));
+        // extension filters
+        assert!(ig.is_noise("/tmp/foo.tmp"));
+        assert!(ig.is_noise("/tmp/foo.temp"));
+        assert!(ig.is_noise("/tmp/foo.bak"));
+        assert!(!ig.is_noise("/home/user/notes.txt"));
+        // trailing tilde
+        assert!(ig.is_noise("/home/user/backup~"));
+    }
+
+    #[test]
+    fn test_index_file_roundtrip() {
+        let tmp = std::env::temp_dir().join("libanything-roundtrip.anythingindex");
+        let records = vec![
+            FileRecord { id: 1, parent_id: 0, name: "/".into() },
+            FileRecord { id: 2, parent_id: 1, name: "/home".into() },
+            FileRecord { id: 3, parent_id: 2, name: "/home/user".into() },
+        ];
+        let cancel = AtomicBool::new(false);
+
+        build_index_file(&records, &tmp, false, &cancel).unwrap();
+
+        let reader = IndexReader::open(&tmp).unwrap();
+        assert_eq!(reader.entry_count, 3);
+        assert_eq!(reader.get_name(&reader.entries[0]), "/");
+        assert_eq!(reader.get_name(&reader.entries[2]), "/home/user");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_compressed_roundtrip() {
+        let tmp = std::env::temp_dir().join("libanything-compressed.anythingindex");
+        let records = vec![
+            FileRecord { id: 1, parent_id: 0, name: "/".into() },
+            FileRecord { id: 2, parent_id: 1, name: "/home/user/document.txt".into() },
+        ];
+        let cancel = AtomicBool::new(false);
+
+        build_index_file(&records, &tmp, true, &cancel).unwrap();
+        let reader = IndexReader::open(&tmp).unwrap();
+        assert_eq!(reader.entry_count, 2);
+        assert_eq!(reader.get_name(&reader.entries[1]), "/home/user/document.txt");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
 }

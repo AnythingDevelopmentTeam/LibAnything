@@ -4,14 +4,12 @@ version = "0.2.0"
 edition = "2021"
 
 [lib]
-crate-type = ["lib", "cdylib", "staticlib"]
+crate-type = ["lib"]
 
 [dependencies]
-log = "0.4"
-
-[target.'cfg(windows)'.dependencies]
-# Все WinAPI вызовы объявлены вручную через extern "system"
-# (см. src/win32_ffi.rs) — никакой внешней зависимости не требуется.
+log = "0.4.32"
+zstd = "0.13.3"
+jwalk = "0.8.1"
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = "0.2.186"

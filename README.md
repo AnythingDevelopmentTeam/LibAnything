@@ -1,32 +1,45 @@
 # LibAnything
 
-Low-level filesystem indexer — the core scanning engine for Anything.
+Low-level filesystem indexer — walks `/` recursively and writes a YAML index.
+
+Index output: `~/.config/anything-index.yaml`
 
 ## Architecture
 
-- **Windows:** reads raw volume (`\\.\C:`) via `CreateFileW` (direct MFT access)
-- **POSIX:** recursive directory tree walk via `std::fs::read_dir`
+Recursive directory tree walk via `std::fs::read_dir` from `/`, recording every
+file and directory. Symlinks are skipped to prevent cycles.
 
-Exports a C ABI (`cdylib`) for dynamic loading from any language.
+Linked into `searchengine` — both compile into a single `.so`/`.dll`.
 
-## Build
+## API
 
-```sh
-cargo build --release
+```rust
+use libanything::{Indexer, IndexerStatus};
+
+let mut indexer = Indexer::new("/home/user/.config/anything-index.yaml");
+indexer.start();
+
+loop {
+    match indexer.status() {
+        IndexerStatus::Running => println!("Progress: {}", indexer.progress()),
+        IndexerStatus::Completed => break,
+        IndexerStatus::Failed => { eprintln!("Failed"); break; }
+        _ => {}
+    }
+    std::thread::sleep(Duration::from_millis(500));
+}
 ```
 
-Output: `target/release/libanything.{dll,so,dylib}`
+## Tests
 
-## FFI
+```sh
+cargo test
+```
 
-| Function | Description |
-|----------|-------------|
-| `init_indexer(volume_path)` | Open volume handle |
-| `shutdown_indexer()` | Close volume handle |
-| `run_indexation(callback)` | Walk filesystem, call callback per entry |
-| `scan_directories(roots)` | Public Rust API — returns `Vec<String>` of file paths |
+4 unit tests covering: walk, cancel, YAML roundtrip, lifecycle.
 
 ## Dependencies
 
 - `log` — logging facade
-- `libc` (Unix only) — POSix FFI
+- `serde` + `serde_yaml` — YAML index serialization
+- `libc` (Unix only) — POSIX FFI
