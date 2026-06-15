@@ -6,10 +6,6 @@ use std::sync::{Arc, RwLock};
 mod index_format;
 pub use index_format::*;
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Data
-// ──────────────────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone)]
 pub struct FileRecord {
     pub id: u64,
@@ -24,10 +20,6 @@ pub enum IndexerStatus {
     Completed,
     Failed,
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// IgnoreConfig — rules for skipping dirs/files during walk & search
-// ──────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct IgnoreConfig {
@@ -45,7 +37,6 @@ impl IgnoreConfig {
         }
     }
 
-    /// Directory path prefixes that should not be entered during the walk.
     pub fn is_skip_dir(&self, path: &Path) -> bool {
         let s = path.to_string_lossy();
         self.skip_dir_prefixes
@@ -53,7 +44,6 @@ impl IgnoreConfig {
             .any(|p| s == *p || (s.starts_with(p) && s.as_bytes().get(p.len()) == Some(&b'/')))
     }
 
-    /// File that should be filtered out from search results by name.
     pub fn is_noise(&self, path: &str) -> bool {
         let name = match Path::new(path).file_name().and_then(|n| n.to_str()) {
             Some(n) => n,
@@ -80,9 +70,7 @@ impl IgnoreConfig {
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Indexer — walks from /, writes .anythingindex
-// ──────────────────────────────────────────────────────────────────────────────
+
 
 pub struct Indexer {
     cancel: Arc<AtomicBool>,
@@ -143,12 +131,6 @@ impl Indexer {
 
             *shared_records.write().unwrap() = records.clone();
 
-            let cancel_watchdog = cancel.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(45));
-                cancel_watchdog.store(true, Ordering::SeqCst);
-            });
-
             walk(Path::new("/"), &mut records, &shared_records, &cancel, &progress, &ignore);
 
             if cancel.load(Ordering::SeqCst) {
@@ -192,11 +174,11 @@ impl Indexer {
     pub fn partial_records(&self) -> Vec<FileRecord> {
         self.records.read().unwrap().clone()
     }
-}
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Filesystem walk
-// ──────────────────────────────────────────────────────────────────────────────
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+}
 
 fn walk(
     root: &Path,
@@ -270,10 +252,6 @@ fn walk(
         }
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Tests
-// ──────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

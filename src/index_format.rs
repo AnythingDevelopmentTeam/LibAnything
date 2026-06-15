@@ -43,21 +43,15 @@ use std::sync::atomic::AtomicBool;
 
 use crate::FileRecord;
 
-// ── Constants ────────────────────────────────────────────────────────────────
-
 const MAGIC: [u8; 8] = [0x41, 0x4E, 0x59, 0x49, 0x44, 0x58, 0x01, 0x00]; // "ANYIDX\1\0"
 const HEADER_SIZE: u64 = 80;
 const ENTRY_SIZE: u64 = 12;
 const FORMAT_VERSION: u32 = 1;
 
-// ── Flags ────────────────────────────────────────────────────────────────────
-
 const FLAG_NAMES_COMPRESSED: u16 = 0x0001;
 const FLAG_HAS_DRIVE_INFO: u16 = 0x0002;
 
 
-
-// ── Drive info ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct DriveInfo {
@@ -151,9 +145,10 @@ pub fn check_drive_changes(stored: &[DriveInfo]) -> Vec<String> {
         if !drive.volume_id.is_empty() {
             if let Ok(meta) = path.metadata() {
                 let current_dev = meta.dev();
-                let stored_dev = u64::from_le_bytes(
-                    drive.volume_id[..8].try_into().unwrap_or([0; 8])
-                );
+                let mut dev_bytes = [0u8; 8];
+                let len = drive.volume_id.len().min(8);
+                dev_bytes[..len].copy_from_slice(&drive.volume_id[..len]);
+                let stored_dev = u64::from_le_bytes(dev_bytes);
                 if current_dev != stored_dev {
                     changed.push(drive.path.clone());
                 }
@@ -162,8 +157,6 @@ pub fn check_drive_changes(stored: &[DriveInfo]) -> Vec<String> {
     }
     changed
 }
-
-// ── Builder (write path) ─────────────────────────────────────────────────────
 
 pub struct IndexBuilder {
     entries: Vec<(u32, u32, String)>, // (id, parent_id, path)
@@ -306,8 +299,6 @@ impl IndexBuilder {
     }
 }
 
-// ── Reader ───────────────────────────────────────────────────────────────────
-
 pub struct IndexReader {
     pub entries: Vec<Entry>,
     pub drives: Vec<DriveInfo>,
@@ -432,8 +423,6 @@ impl IndexReader {
         self.entries.binary_search_by_key(&id, |e| e.id).ok().map(|i| &self.entries[i])
     }
 }
-
-// ── Integrate with Indexer ───────────────────────────────────────────────────
 
 pub fn build_index_file(
     records: &[FileRecord],
