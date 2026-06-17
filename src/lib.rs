@@ -41,7 +41,7 @@ impl IgnoreConfig {
         let s = path.to_string_lossy();
         self.skip_dir_prefixes
             .iter()
-            .any(|p| s == *p || (s.starts_with(p) && s.as_bytes().get(p.len()) == Some(&b'/')))
+            .any(|p| s == *p || (s.starts_with(p) && matches!(s.as_bytes().get(p.len()), Some(&b'/') | Some(&b'\\'))))
     }
 
     pub fn is_noise(&self, path: &str) -> bool {
@@ -71,6 +71,17 @@ impl IgnoreConfig {
 }
 
 
+
+#[cfg(windows)]
+fn default_root() -> PathBuf {
+    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    PathBuf::from(format!("{}\\", drive))
+}
+
+#[cfg(not(windows))]
+fn default_root() -> PathBuf {
+    PathBuf::from("/")
+}
 
 pub struct Indexer {
     cancel: Arc<AtomicBool>,
@@ -125,13 +136,13 @@ impl Indexer {
             records.push(FileRecord {
                 id: 1,
                 parent_id: 0,
-                name: "/".into(),
+                name: default_root().to_string_lossy().to_string(),
             });
             progress.fetch_add(1, Ordering::SeqCst);
 
             *shared_records.write().unwrap() = records.clone();
 
-            walk(Path::new("/"), &mut records, &shared_records, &cancel, &progress, &ignore);
+            walk(&default_root(), &mut records, &shared_records, &cancel, &progress, &ignore);
 
             if cancel.load(Ordering::SeqCst) {
                 *status.write().unwrap() = IndexerStatus::Idle;
@@ -323,7 +334,7 @@ mod tests {
         records.push(FileRecord {
             id: 1,
             parent_id: 0,
-            name: "/".into(),
+            name: default_root().to_string_lossy().to_string(),
         });
         let cancel = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
@@ -349,41 +360,52 @@ mod tests {
         records.push(FileRecord {
             id: 1,
             parent_id: 0,
-            name: "/".into(),
+            name: default_root().to_string_lossy().to_string(),
         });
 
-        walk(Path::new("/"), &mut records, &shared, &cancel, &progress, &ignore);
+        walk(&default_root(), &mut records, &shared, &cancel, &progress, &ignore);
         assert_eq!(records.len(), 1);
     }
 
     #[test]
     fn test_skip_dir_filtering() {
         let ig = test_ignore();
-        assert!(ig.is_skip_dir(Path::new("/proc")));
-        assert!(ig.is_skip_dir(Path::new("/proc/self")));
-        assert!(ig.is_skip_dir(Path::new("/sys/class")));
-        assert!(ig.is_skip_dir(Path::new("/dev")));
-        assert!(ig.is_skip_dir(Path::new("/dev/shm")));
-        assert!(ig.is_skip_dir(Path::new("/run/user/1000")));
-        assert!(ig.is_skip_dir(Path::new("/snap/core/1234")));
-        assert!(ig.is_skip_dir(Path::new("/lost+found")));
-        assert!(ig.is_skip_dir(Path::new("/var/lib/docker/overlay2")));
-        assert!(ig.is_skip_dir(Path::new("/var/lib/flatpak/repo")));
-        assert!(ig.is_skip_dir(Path::new("/tmp")));
-        assert!(ig.is_skip_dir(Path::new("/tmp/foo")));
-        assert!(ig.is_skip_dir(Path::new("/boot")));
-        assert!(ig.is_skip_dir(Path::new("/lib/x86_64-linux-gnu")));
-        assert!(ig.is_skip_dir(Path::new("/lib64")));
-        assert!(ig.is_skip_dir(Path::new("/usr/lib/python3")));
-        assert!(ig.is_skip_dir(Path::new("/usr/share/zoneinfo/America")));
-        assert!(ig.is_skip_dir(Path::new("/usr/share/doc/bash")));
-        assert!(ig.is_skip_dir(Path::new("/usr/include/linux")));
-        assert!(ig.is_skip_dir(Path::new("/var/cache/apt")));
-        assert!(ig.is_skip_dir(Path::new("/var/log/syslog")));
-        assert!(ig.is_skip_dir(Path::new("/opt/google")));
-        assert!(ig.is_skip_dir(Path::new("/sysroot")));
-        assert!(!ig.is_skip_dir(Path::new("/home/user/proc")));
-        assert!(!ig.is_skip_dir(Path::new("/home/user/dev")));
+
+        #[cfg(unix)]
+        {
+            assert!(ig.is_skip_dir(Path::new("/proc")));
+            assert!(ig.is_skip_dir(Path::new("/proc/self")));
+            assert!(ig.is_skip_dir(Path::new("/sys/class")));
+            assert!(ig.is_skip_dir(Path::new("/dev")));
+            assert!(ig.is_skip_dir(Path::new("/dev/shm")));
+            assert!(ig.is_skip_dir(Path::new("/run/user/1000")));
+            assert!(ig.is_skip_dir(Path::new("/snap/core/1234")));
+            assert!(ig.is_skip_dir(Path::new("/lost+found")));
+            assert!(ig.is_skip_dir(Path::new("/var/lib/docker/overlay2")));
+            assert!(ig.is_skip_dir(Path::new("/var/lib/flatpak/repo")));
+            assert!(ig.is_skip_dir(Path::new("/tmp")));
+            assert!(ig.is_skip_dir(Path::new("/tmp/foo")));
+            assert!(ig.is_skip_dir(Path::new("/boot")));
+            assert!(ig.is_skip_dir(Path::new("/lib/x86_64-linux-gnu")));
+            assert!(ig.is_skip_dir(Path::new("/lib64")));
+            assert!(ig.is_skip_dir(Path::new("/usr/lib/python3")));
+            assert!(ig.is_skip_dir(Path::new("/usr/share/zoneinfo/America")));
+            assert!(ig.is_skip_dir(Path::new("/usr/share/doc/bash")));
+            assert!(ig.is_skip_dir(Path::new("/usr/include/linux")));
+            assert!(ig.is_skip_dir(Path::new("/var/cache/apt")));
+            assert!(ig.is_skip_dir(Path::new("/var/log/syslog")));
+            assert!(ig.is_skip_dir(Path::new("/opt/google")));
+            assert!(ig.is_skip_dir(Path::new("/sysroot")));
+            assert!(!ig.is_skip_dir(Path::new("/home/user/proc")));
+            assert!(!ig.is_skip_dir(Path::new("/home/user/dev")));
+        }
+
+        #[cfg(windows)]
+        {
+            // With Linux-only prefix list, no Windows paths should match
+            assert!(!ig.is_skip_dir(Path::new("C:\\Users")));
+            assert!(!ig.is_skip_dir(Path::new("C:\\Windows\\System32")));
+        }
     }
 
     #[test]

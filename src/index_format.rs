@@ -3,7 +3,43 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+fn get_drive_id(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    path.metadata().map(|m| m.dev()).unwrap_or(0)
+}
+
+#[cfg(windows)]
+fn get_drive_id(path: &Path) -> u64 {
+    extern "system" {
+        fn GetVolumeInformationW(
+            lpRootPathName: *const u16,
+            lpVolumeNameBuffer: *mut u16,
+            nVolumeNameSize: u32,
+            lpVolumeSerialNumber: *mut u32,
+            lpMaximumComponentLength: *mut u32,
+            lpFileSystemFlags: *mut u32,
+            lpFileSystemNameBuffer: *mut u16,
+            nFileSystemNameSize: u32,
+        ) -> i32;
+    }
+
+    use std::os::windows::ffi::OsStrExt;
+    let root: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut serial: u32 = 0;
+    let result = unsafe {
+        GetVolumeInformationW(
+            root.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            &mut serial,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 { serial as u64 } else { 0 }
+}
 //
 // Layout:
 //   [Header] [Tree Data] [Drive Data] [Name Block]
@@ -84,23 +120,19 @@ fn detect_drives() -> Vec<DriveInfo> {
                     }
                 }
                 // Get device ID
-                if let Ok(meta) = std::fs::metadata(mount_point) {
-                    let dev = meta.dev();
-                    drives.push(DriveInfo {
-                        path: mount_point.to_string(),
-                        volume_id: dev.to_le_bytes().to_vec(),
-                    });
-                }
+                let dev = get_drive_id(Path::new(mount_point));
+                drives.push(DriveInfo {
+                    path: mount_point.to_string(),
+                    volume_id: dev.to_le_bytes().to_vec(),
+                });
             }
         }
         // Always include / as a fallback
         if !drives.iter().any(|d| d.path == "/") {
-            if let Ok(meta) = std::fs::metadata("/") {
-                drives.push(DriveInfo {
-                    path: "/".to_string(),
-                    volume_id: meta.dev().to_le_bytes().to_vec(),
-                });
-            }
+            drives.push(DriveInfo {
+                path: "/".to_string(),
+                volume_id: get_drive_id(Path::new("/")).to_le_bytes().to_vec(),
+            });
         }
     }
 
@@ -130,6 +162,64 @@ fn detect_drives() -> Vec<DriveInfo> {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        // Use PowerShell to enumerate fixed drives with serial numbers
+        let ps_script = "Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | Select-Object DeviceID, VolumeSerialNumber | ConvertTo-Csv -NoTypeInformation";
+        let mut ps_ok = false;
+        if let Ok(output) = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", ps_script])
+            .output()
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines().skip(1) {
+                    let line = line.trim();
+                    if line.is_empty() { continue; }
+                    // CSV: "DeviceID","VolumeSerialNumber"
+                    let trimmed = line.trim_matches('"');
+                    let parts: Vec<&str> = trimmed.split("\",\"").collect();
+                    if parts.len() >= 2 {
+                        let device_id = parts[0].trim_matches('"');
+                        let serial = parts[1].trim_matches('"');
+                        let vol_bytes = if !serial.is_empty() {
+                            u32::from_str_radix(serial, 16)
+                                .unwrap_or(0)
+                                .to_le_bytes()
+                                .to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                        drives.push(DriveInfo {
+                            path: format!("{}\\", device_id),
+                            volume_id: vol_bytes,
+                        });
+                    }
+                }
+                if !drives.is_empty() { ps_ok = true; }
+            }
+        }
+
+        // Fallback: enumerate drive letters A:-Z:
+        if !ps_ok {
+            for letter in 'A'..='Z' {
+                let root = format!("{}:\\", letter);
+                if Path::new(&root).exists() {
+                    let vol_id = get_drive_id(Path::new(&root)).to_le_bytes().to_vec();
+                    drives.push(DriveInfo { path: root, volume_id: vol_id });
+                }
+            }
+        }
+
+        // Always include system drive
+        let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+        let root_path = format!("{}\\", system_drive);
+        if !drives.iter().any(|d| d.path == root_path) {
+            let vol_id = get_drive_id(Path::new(&root_path)).to_le_bytes().to_vec();
+            drives.push(DriveInfo { path: root_path, volume_id: vol_id });
+        }
+    }
+
     drives
 }
 
@@ -142,16 +232,14 @@ pub fn check_drive_changes(stored: &[DriveInfo]) -> Vec<String> {
             changed.push(drive.path.clone());
             continue;
         }
-        if !drive.volume_id.is_empty() {
-            if let Ok(meta) = path.metadata() {
-                let current_dev = meta.dev();
-                let mut dev_bytes = [0u8; 8];
-                let len = drive.volume_id.len().min(8);
-                dev_bytes[..len].copy_from_slice(&drive.volume_id[..len]);
-                let stored_dev = u64::from_le_bytes(dev_bytes);
-                if current_dev != stored_dev {
-                    changed.push(drive.path.clone());
-                }
+        if !drive.volume_id.is_empty() && path.exists() {
+            let current_dev = get_drive_id(path);
+            let mut dev_bytes = [0u8; 8];
+            let len = drive.volume_id.len().min(8);
+            dev_bytes[..len].copy_from_slice(&drive.volume_id[..len]);
+            let stored_dev = u64::from_le_bytes(dev_bytes);
+            if current_dev != stored_dev {
+                changed.push(drive.path.clone());
             }
         }
     }
